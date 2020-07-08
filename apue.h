@@ -14,6 +14,7 @@
 #include <sys/termios.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #if defined(MACOS) || !defined(TIOCGWINSZ)
 #include <sys/ioctl.h>
 #endif
@@ -31,11 +32,23 @@
 #include <limits.h>
 #include <errno.h>
 
+#include <time.h>
+
 #include <syslog.h>
 #include <fcntl.h>
 #include <sys/resource.h>
 
 #include <string.h>
+
+#define CONTROLLEN CMSG_LEN(sizeof(int))
+
+static struct cmsghdr	*cmptr = NULL;
+
+#define QLEN 10
+#define STALE 30
+
+#define CLI_PATH "/var/tmp/"
+#define CLI_PERM S_IRWXU
 
 #define MAXSLEEP 128
 
@@ -581,6 +594,292 @@ errout:
 	errno = err;
 
 	return -1;
+}
+
+int fd_pipe(int fd[2])
+{
+	return (socketpair(AF_UNIX, SOCK_STREAM, 0, fd));
+}
+
+int serv_listen(const char *name)
+{
+	int					fd, len, err, rval;
+	struct sockaddr_un	un;
+
+	if (strlen(name) >= sizeof(un.sun_path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+		return -2;
+
+	unlink(name);
+
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	strcpy(un.sun_path, name);
+	len = offsetof(struct sockaddr_un, sun_path) + strlen(name);
+
+	if (bind(fd, (struct sockaddr *)&un, len) < 0) {
+		rval = -3;
+		goto errout;
+	}
+
+	if (listen(fd, QLEN) < 0) {
+		rval = -4;
+		goto errout;
+	}
+
+	return fd;
+
+errout:
+	err = errno;
+	close(fd);
+	errno = err;
+
+	return rval;
+}
+
+int serv_accept(int listendf, uind_t *uidptr)
+{
+	int					clifd, err, rval;
+	socklen_t			len;
+	time_t				staletime;
+	struct sockaddr_un	un;
+	struct stat			statbuf;
+	char				*name;
+
+	if ((name = malloc(sizeof(un.sun_path) + 1)) == NULL)
+		return -1;
+
+	len = sizeof(un);
+	if ((clifd = accept(listenfd, (struct sockaddr *)&un, &len)) < 0) {
+		free(name);
+		return -2;
+	}
+
+	len -= offsetof(struct sockaddr_un, sun_path);
+	memcpy(name, un.sun_path, len);
+	name[len] = 0;
+
+	if (stat(name, &statbuf) < 0) {
+		rval = -3;
+		goto errout;
+	}
+
+
+#ifdef S_ISSOCK
+	if (S_ISSOCK(statbuf.st_mode) == 0) {
+		rval = -4;
+		goto errout;
+	}
+#endif
+
+	if ((statbuf.st_mode & (S_IRWXG | S_IRWXO)) ||
+		(statbuf.st_mode & S_IRWXU) != S_IRWXU) {
+		rval = -5;
+		goto errout;
+	}
+
+	staletime = time(NULL) - STALE;
+	if (statbuf.st_atime < staletime ||
+		statbuf.st_ctime < staletime ||
+		statbuf.st_mtime < staletime) {
+		rval = -6;
+		goto errout;
+	}
+
+	if (uidptr != NULL)
+		*uidptr = statbuf.st_uid;
+
+	unlink(name);
+	free(name);
+	
+	return (clifd);
+
+errout:
+	err = errno;
+	close(clifd);
+	free(name);
+	errno = err;
+
+	return (rval);
+}
+
+int cli_conn(const char *name)
+{
+	int					fd, len, err, rval;
+	struct sockaddr_un	un, sun;
+	int					do_unlink = 0;
+
+	if (strlen(name) >= sizeof(un.sun_path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+		return -1;
+
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	sprintf(un.sun_path, "%s%05ld", CLI_PATH, (long)getpid());
+	len = offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path);
+
+	unlink(un.sun_path);
+
+	if (bind(fd, (struct sockaddr *)&un, len) < 0) {
+		rval = -2;
+		goto errout;
+	}
+
+	if (chmod(un.sun_path, CLI_PERM) < 0) {
+		rval = -3;
+		do_unlink = 1;
+		goto errout;
+	}
+
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strcpy(sun.sun_path, name);
+	len = offsetof(struct sockaddr_un, sun_path) + strlen(name);
+	if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
+		rval = -4;
+		do_unlink = 1;
+		goto errout;
+	}
+
+	return fd;
+
+errout:
+	err = errno;
+	close(fd);
+	if (do_unlink)
+		unlink(un.sun_path);
+
+	errno = err;
+	
+	return rval;
+}
+
+int send_err(int fd, int errcode, const char *msg)
+{
+	int		n;
+
+	if ((n = strlen(msg)) > 0)
+		if (writen(fd, msg, n) != n)
+			return -1;
+
+	if (errcode >= 0)
+		errcode = -1;
+
+	if (send_fd(fd, errcode) < 0)
+		return -1;
+
+	return 0;
+}
+
+
+int send_fd(int fd, int fd_to_sned)
+{
+	struct iovec	iov[1];
+	struct msghdr	msg;
+	char			buf[2];
+
+	iov[0].iov_base = buf;
+	iov[0].iov_len 	= 2;
+	msg.msg_iov 	= iov;
+	msg.msg_iovlen	= 1;
+	msg.msg_name	= name;
+	msg.msg_namelen	= 0;
+
+	if (fd_to_send < 0) {
+		msg.msg_control		= NULL;
+		msg.msg_controllen	= 0;
+		buf[1] = -fd_to_send;
+
+		if (buf[1] == 0)
+			buf[1] = 1;
+
+	} else {
+		if (cmptr == NULL && (cmptr = malloc(CONTROLLEN)) == NULL)
+			return -1;
+
+		cmptr->cmsg_level	= SOL_SOCKET;
+		cmptr->cmsg_type	= SCM_RIGHT;
+		cmptr->cmsg_len		= CONTROLLEN;
+		msg.msg_control		= cmptr;
+		msg.msg_controllen	= CONTROLLEN;
+
+		*(int *)CMSG_DATA(cmptr) = fd_to_send;
+
+		buf[1] = 0;
+	}
+
+	buf[0] = 0;
+
+	if (sendmsg(fd, &msg, 0) != 2)
+		return -1;
+
+	return 0;
+}
+
+int recv_fd(int fd, ssize_t (*userfunc)(int, const void *, size_t))
+{
+	int				newfd, nr, status;
+	char			*ptr;
+	char			buf[MAXLINE];
+	struct iovec	iov[1];
+	struct msghdr	msg;
+
+	status = -1;
+	for (;;) {
+		iov[0].iov_base	= buf;
+		iov[0].iov_len	= sizeof(buf);
+		msg.msg_iov		= iov;
+		msg.msg_iovlen	= 1;
+		msg.msg_name	= NULL;
+		msg.msg_namelen	= 0;
+
+		if (cmptr == NULL && (cmptr = malloc(CONTROLLEN)) == NULL)
+			return -1;
+
+		msg.msg_control		= cmptr;
+		msg.msg_controllen	= CONTROLLEN;
+
+		if ((nr = recvmsg(fd, &msg, 0)) < 0) {
+			err_ret("recvmsg error");
+			return -1;
+		} else if (nr == 0) {
+			err_ret("connection closed by server");
+			return -1;
+		}
+
+		for (ptr = buf; ptr < &buf[nr]; ) {
+			if (*ptr++ == 0) {
+				if (ptr != &buf[nr - 1])
+					err_dump("message format error");
+				status = *ptr & 0xFF;
+
+				if (status == 0) {
+					if (msg.msg_controllen < CONTROLLEN)
+						err_dump("status = 0 but no fd");
+
+					newfd = *(int *)CMSG_DATA(cmptr);
+				} else {
+					newfd = -status;
+				}
+
+				nr -= 2;
+			}
+		}
+
+		if (nr > 0 && (*userfunc)(STDERR_FILENO, buf, nr) != nr)
+			return -1;
+
+		if (status >= 0)
+			return newfd;
+	}
 }
 
 #endif
