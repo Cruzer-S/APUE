@@ -57,6 +57,10 @@ static struct cmsghdr	*cmptr = NULL;
 
 extern int lockfile(int);
 
+static struct termios			save_termios;
+static int						ttysavefd = -1;
+static enum { RESET, RAW, CBREAK }	ttystate = RESET;
+
 
 #ifdef	PATH_MAX
 static long pathmax = PATH_MAX;
@@ -114,7 +118,7 @@ int		buf_args(char *, int (*func)(int,
 int		tty_cbreak(int);
 int		tty_raw(int);
 int		tty_reset(int);
-int		tty_atexit(void);
+void	tty_atexit(void);
 struct termios	*tty_termios(void);
 
 int		ptym_open(char *, int);
@@ -641,7 +645,7 @@ errout:
 	return rval;
 }
 
-int serv_accept(int listendf, uind_t *uidptr)
+int serv_accept(int listenfd, uid_t *uidptr)
 {
 	int					clifd, err, rval;
 	socklen_t			len;
@@ -780,7 +784,7 @@ int send_err(int fd, int errcode, const char *msg)
 }
 
 
-int send_fd(int fd, int fd_to_sned)
+int send_fd(int fd, int fd_to_send)
 {
 	struct iovec	iov[1];
 	struct msghdr	msg;
@@ -790,7 +794,7 @@ int send_fd(int fd, int fd_to_sned)
 	iov[0].iov_len 	= 2;
 	msg.msg_iov 	= iov;
 	msg.msg_iovlen	= 1;
-	msg.msg_name	= name;
+	msg.msg_name	= NULL;
 	msg.msg_namelen	= 0;
 
 	if (fd_to_send < 0) {
@@ -806,7 +810,7 @@ int send_fd(int fd, int fd_to_sned)
 			return -1;
 
 		cmptr->cmsg_level	= SOL_SOCKET;
-		cmptr->cmsg_type	= SCM_RIGHT;
+		cmptr->cmsg_type	= SCM_RIGHTS;
 		cmptr->cmsg_len		= CONTROLLEN;
 		msg.msg_control		= cmptr;
 		msg.msg_controllen	= CONTROLLEN;
@@ -880,6 +884,174 @@ int recv_fd(int fd, ssize_t (*userfunc)(int, const void *, size_t))
 		if (status >= 0)
 			return newfd;
 	}
+}
+
+ssize_t readn(int fd, void *ptr, size_t n)
+{
+	size_t		nleft;
+	ssize_t		nread;
+
+	nleft = n;
+	while (nleft > 0) {
+		if ((nread = read(fd, ptr, nleft)) < 0) {
+			if (nleft == n)
+				return -1;
+			else
+				break;
+		} else if (nread == 0) {
+			break;
+		}
+
+		nleft	-= nread;
+		ptr		+= nread;
+	}
+
+	return (n - nleft);
+}
+
+ssize_t writen(int fd, const void *ptr, size_t n)
+{
+	size_t		nleft;
+	ssize_t		nwritten;
+
+	nleft = n;
+	while (nleft > 0) {
+		if ((nwritten = write(fd, ptr, nleft)) < 0) {
+			if (nleft == n)
+				return -1;
+			else
+				break;
+		} else if (nwritten == 0) {
+			break;
+		}
+
+		nleft	-= nwritten;
+		ptr		+= nwritten;
+	}
+
+	return (n - nleft);
+}
+
+int tty_cbreak(int fd)
+{
+	int				err;
+	struct termios	buf;
+
+	if (ttystate != RESET) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (tcgetattr(fd, &buf) < 0)
+		return -1;
+
+	save_termios = buf;
+
+	buf.c_lflag &= ~(ECHO | ICANON);
+
+	buf.c_cc[VMIN] = 1;
+	buf.c_cc[VTIME] = 0;
+
+	if (tcsetattr(fd, TCSAFLUSH, &buf) < 0)
+		return -1;
+
+	if (tcgetattr(fd, &buf) < 0) {
+		err = errno;
+		tcsetattr(fd, TCSAFLUSH, &save_termios);
+		errno = err;
+		return -1;
+	}
+
+	if ((buf.c_lflag & (ECHO | ICANON)) || buf.c_cc[VMIN] != 1 ||
+			buf.c_cc[VTIME] != 0) {
+		tcsetattr(fd, TCSAFLUSH, &save_termios);
+		errno = EINVAL;
+		return -1;
+	}
+
+	ttystate = CBREAK;
+	ttysavefd = fd;
+
+	return 0;
+}
+
+int tty_raw(int fd)
+{
+	int				err;
+	struct termios 	buf;
+
+	if (ttystate != RESET) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (tcgetattr(fd, &buf) < 0)
+		return -1;
+
+	save_termios = buf;
+
+	buf.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+
+	buf.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+
+	buf.c_cflag &= ~(CSIZE | PARENB);
+
+	buf.c_cflag |= CS8;
+
+	buf.c_oflag &= ~(OPOST);
+
+	buf.c_cc[VMIN] = 1;
+	buf.c_cc[VTIME] = 0;
+	if (tcsetattr(fd, TCSAFLUSH, &buf) < 0)
+		return -1;
+
+	if (tcgetattr(fd, &buf) < 0) {
+		err = errno;
+		tcsetattr(fd, TCSAFLUSH, &save_termios);
+		errno = err;
+
+		return -1;
+	}
+
+	if ((buf.c_lflag & (ECHO | ICANON | IEXTEN | ISIG)) ||
+		(buf.c_iflag & (BRKINT | ICRNL | INPCK | ISTRIP | IXON)) ||
+		(buf.c_cflag & (CSIZE | PARENB | CS8)) != CS8 ||
+		(buf.c_oflag & OPOST) || buf.c_cc[VMIN] != 1 ||
+		buf.c_cc[VTIME] != 0) {
+		tcsetattr(fd, TCSAFLUSH, &save_termios);
+		errno = EINVAL;
+		return -1;
+	}
+
+	ttystate = RAW;
+	ttysavefd = fd;
+	
+	return 0;
+}
+
+int tty_reset(int fd)
+{
+	if (ttystate == RESET)
+		return 0;
+
+	if (tcsetattr(fd, TCSAFLUSH, &save_termios) < 0)
+		return -1;
+
+	ttystate = RESET;
+
+	return 0;
+}
+
+void tty_atexit(void)
+{
+	if (ttysavefd >= 0)
+		tty_reset(ttysavefd);
+
+}
+
+struct termios *tty_termios(void)
+{
+	return (&save_termios);
 }
 
 #endif
