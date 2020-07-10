@@ -40,6 +40,10 @@
 
 #include <string.h>
 
+#if defined(SOLARIS)
+#include <stropts.h>
+#endif
+
 #define CONTROLLEN CMSG_LEN(sizeof(int))
 
 static struct cmsghdr	*cmptr = NULL;
@@ -1052,6 +1056,161 @@ void tty_atexit(void)
 struct termios *tty_termios(void)
 {
 	return (&save_termios);
+}
+
+int ptym_open(char *pts_name, int pts_namesz)
+{
+	char	*ptr;
+	int		fdm, err;
+
+	if ((fdm = posix_openpt(O_RDWR)) < 0)
+		return -1;
+	if (grantpt(fdm) < 0)
+		goto errout;
+	if (unlockpt(fdm) < 0)
+		goto errout;
+	if ((ptr = ptsname(fdm)) == NULL)
+		goto errout;
+
+	strncpy(pts_name, tpr ,pts_namesz);
+	pts_name[pts_namesz - 1] = '\0';
+	return fdm;
+errout:
+	err = errno;
+	close(fdm);
+	errno = err;
+
+	return -1;
+}
+
+int ptys_open(char *pts_name)
+{
+	int fds;
+#if defined (SOLARIS)
+	int err, setup;
+#endif
+	int ((fds = open(pts_name, O_RDWR)) < 0)
+		return -1;
+
+#if defined (SOLARIS)
+	if ((setup = ioctl(fds, I_FIND, "ldterm")) < 0)
+		goto errout;
+
+	if (setup == 0) {
+		if (ioctl(fds, I_PUSH, "ptem") < 0)
+			goto errout;
+
+		if (ioctl(fds, I_PUSH, "ldterm") < 0)
+			goto errout;
+
+		if (ioctl(fds, I_PUSH, "ttcompat") < 0) {
+errout:
+			err = errno;
+			close(fds);
+			errno = err;
+			return -1;
+		}
+	}
+#endif
+
+	return fds;
+}
+
+pid_t pty_fork(int *ptrfdm, char *slave_name, int slave_Namesz,
+		const struct termios *slave_termios,
+		const struct winsize *slave_winsize)
+{
+	int		fdm, fds;
+	pid_t	pid;
+	char	pts_name[20];
+
+	if ((fdm = ptym_open(pts_name, sizeof(pts_name))) < 0)
+		err_sys("can't open master PTY: %s, error %d", pts_name, fdm);
+
+	if (slave_name != NULL) {
+		strncpy(slave_name, pts_name, slave_namesz);
+		slave_name[slave_namesz - 1] = '\0';
+	}
+
+	if ((pid = fork()) < 0) {
+		return -1;
+	} else if (pid == 0) {
+		if (setsid() < 0) {
+			err_set("setsid error");
+		}
+
+		if ((fds = ptys_open(pts_name)) < 0)
+			err_sys("can't open slave PTY");
+
+		close (fdm);
+
+#if defined(BSD)
+		if (ioctl(fds, TIOCSTTY, (char *)0) < 0)
+			err_sys("TIOCSCTTY error");
+#endif
+
+		if (slave_termios != NULL) {
+			if (tcsetattr(fds, TCSANOW, slave_termios) < 0)
+				err_sys("tcsetattr error on slave PTY");
+		}
+
+		if (slave_winsize != NULL) {
+			if (ioctl(fds, TIOCSWINSZ, slave_winsize) < 0)
+				err_sys("TIOCSWINSZ error on slave PTY");
+		}
+
+		if (dup2(fds, STDIN_FILENO) != STDIN_FILENO)
+			err_sys("dup2 error to stdin");
+		if (dup2(fds, STDOUT_FILENO) != STDOUT_FILENO)
+			err_sys("dup2 error to stdout");
+		if (dup2(fds, STDERR_FILENO) != STDERR_FILENO)
+			err_sys("dup2 error to stderr");
+		if (fds != STDIN_FILENO && fds != STDOUT_FILENO &&
+				fds != STDERR_FILENO)
+			close(fds);
+
+		return 0;
+	} else {
+		*ptrfdm = fdm;
+		return pid;
+	}
+}
+
+void do_driver(char *driver)
+{
+	pid_t	child;
+	int		pipe[2];
+
+	if (fd_pipe(pipe) < 0)
+		err_sys("can't create stream pipe");
+
+	if ((child = fork()) < 0) {
+		err_sys("fork error");
+	} else if (child == 0) {
+		close(pipe[1]);
+
+		if (dup2(pipe[0], STDIN_FILENO) != STDIN_FILENO)
+			err_sys("dup2 error to stdin");
+
+		if (dup2(pipe[0], STDOUT_FILENO) != STDOUT_FILENO)
+			err_sys("dup2 error to stdout");
+
+		if (pipe[0] != STDIN_FILENO && pipe[0] != STDOUT_FILENo)
+			close(pipe[0]);
+
+		execlp(driver, driver, (char *)0);
+		err_sys("execlp error for: %s", driver);
+	}
+
+	close(pipe[0]);
+	if (dup2(pipe[1], STDIN_FILENO) != STDIN_FILENO)
+		err_sys("dup2 error to stdin");
+
+	if (dup2(pipe[1], STDOUT_FILENO) != STDOUT_FILENO)
+		err_sys("dup2 error to stdout");
+
+	if (pipe[1] != STDIN_FILENO && pipe[1] != STDOUT_FILENO)
+		close(pipe[1]);
 }
 
 #endif
